@@ -1,0 +1,500 @@
+extensions [ gis palette ]
+
+globals [
+  projection
+  ignition
+  initial-trees
+  burned-trees
+  currently-burning
+  veg-density-dataset
+  fire-threat-dataset
+  elev-dataset
+;  roads-dataset
+  nodes-dataset
+  node-name
+  subdivisions
+  p1 p2 full-list
+  burned-cars
+  exited-cars
+  evacuated?
+  temp
+  time0 time1 time2 time3 time4 time5 time6 time7 time8 time9
+    ]
+
+patches-own [
+  burning?
+  veg-density
+  fire-threat
+  elev
+  is-road?
+  ]
+
+breed [ nodes node ]
+breed [ cars car ]
+breed [ exits exit ]
+cars-own [current-location destination stopped? link-dest]
+nodes-own [dist-exit is-dest? dist-exit0 dist-exit1]
+
+to setup
+  clear-all
+  reset-ticks
+  set burned-cars 0
+  set exited-cars 0
+  set evacuated? false
+  set projection "WGS_84_Geographic"
+  ; Note that setting the coordinate system here is optional, as
+  ; long as all of your datasets use the same coordinate system.
+  gis:load-coordinate-system (word "WGS84/" projection ".prj")
+  ; Load all of our datasets
+  set veg-density-dataset gis:load-dataset "WGS84/veg_frac_10m_wgs84.asc"
+  match-cells-to-patches
+  set fire-threat-dataset gis:load-dataset "WGS84/threat_prob_5m_wgs84.asc"
+  set elev-dataset gis:load-dataset "WGS84/dem_ut_5m_wgs84.asc"
+  set subdivisions gis:load-dataset "WGS84/Subdivisions.shp"
+;  set roads-dataset gis:load-dataset "WGS84/roads_new.shp"
+  set nodes-dataset gis:load-dataset "WGS84/nodes_new.shp"
+  ; Set the world envelope to the union of all of our dataset's envelopes
+  gis:set-world-envelope (gis:envelope-of veg-density-dataset)
+  display-vegetation-in-patches
+;  match-cells-to-patches
+  ; draw additional features
+  gis:set-drawing-color blue
+  gis:draw subdivisions 1
+;  gis:set-drawing-color red
+;  gis:draw roads-dataset 1
+  ; set up road network and cars
+  make-road-network
+  make-links
+  assign-distances
+;  setup-cars
+  ; set initial fire point
+;  ask one-of patches with [veg-density > 0.75]
+;  ask patches with [pxcor = 454 and pycor = 21]
+;  ask patches with [pxcor = 225 and pycor = 12]
+;  ask one-of patches with [ fire-threat > 0.8 ]
+  ask one-of patches with [ fire-threat > 0.8 and veg-density > 0.05 and (pxcor < 50 or pycor < 50 )]
+    [ ignite ]
+  set initial-trees count patches with [veg-density > 0.05]
+  set burned-trees 0
+  reset-ticks
+end
+
+to display-elevation
+  ; Now, just to make sure it worked, we'll color each patch by its vegetation value.
+  let min-elev gis:minimum-of elev-dataset
+  let max-elev gis:maximum-of elev-dataset
+  ask patches
+  [ ; note the use of the "<= 0 or >= 0" technique to filter out
+    ; "not a number" values, as discussed in the documentation.
+    if (elev <= 0) or (elev >= 0)
+    ;[ set pcolor scale-color green veg-density min-veg-density max-veg-density ] ]
+    [ set pcolor palette:scale-gradient [[0 0 0] [255 255 255]] elev min-elev max-elev ] ]
+  ask patches
+  [if elev < 0.1
+    [ set pcolor black]
+  ]
+end
+
+to display-vegetation-in-patches
+  ; This is the preferred way of copying values from a raster dataset
+  ; into a patch variable: in one step, using gis:apply-raster.
+  gis:apply-raster veg-density-dataset veg-density
+  gis:apply-raster fire-threat-dataset fire-threat
+  gis:apply-raster elev-dataset elev
+  ; Now, just to make sure it worked, we'll color each patch by its
+  ; vegetation value.
+  let min-veg-density gis:minimum-of veg-density-dataset
+  let max-veg-density gis:maximum-of veg-density-dataset
+  ask patches
+  [ ; note the use of the "<= 0 or >= 0" technique to filter out
+    ; "not a number" values, as discussed in the documentation.
+    if (veg-density <= 0) or (veg-density >= 0)
+    ;[ set pcolor scale-color green veg-density min-veg-density max-veg-density ] ]
+    [ set pcolor palette:scale-gradient [[255 255 255] [0 255 0]] veg-density min-veg-density max-veg-density ] ]
+  ask patches
+  [if veg-density < 0.1
+    [ set pcolor black]
+  ]
+end
+
+; This is an example of how to select a subset of a raster dataset
+; whose size and shape matches the dimensions of the NetLogo world.
+; It doesn't actually draw anything; it just modifies the coordinate
+; transformation to line up patch boundaries with raster cell
+; boundaries. You need to call one of the other commands after calling
+; this one to see its effect.
+to match-cells-to-patches
+  gis:set-world-envelope gis:raster-world-envelope veg-density-dataset 0 0
+  clear-drawing
+  clear-turtles
+end
+
+to ignite
+  set pcolor red
+  set burning? true
+  set burned-trees burned-trees + 1
+end
+
+to go
+  ; remove cars at exits
+  ask node 19
+  [ ask cars in-radius 5
+      [ set exited-cars exited-cars + 1
+      die ] ]
+   ask node 14
+  [ ask cars in-radius 5
+      [ set exited-cars exited-cars + 1
+      die ] ]
+  ask cars with [not stopped?] [
+    if any? patches with [ pcolor = red] in-radius 5
+      [set burned-cars burned-cars + 1
+       set stopped? true
+       set color red ]
+  ]
+
+;   if not any? cars
+;    [stop]
+  ; move cars
+;  ask cars [ move ]
+  ; spread the fire
+  spread-fire
+;  if ticks mod 10 = 0
+;  [ spread-fire ]
+  ; end simulation if fire extinguishes
+  ; check for fire approaching neighborhood, if so start evacuation
+  if not evacuated?
+;    [ if any? patches with [ pxcor > 125 and pycor > (-0.7324 * pxcor + 411) and pcolor = red ]
+    [ if any? patches with [ pxcor > 60 and pycor > (-0.6364 * pxcor + 208) and pcolor = red ]
+      [ car-release-times
+
+        repeat 10 [ spawn-cars ]
+        let evac-time ticks
+        show "Evacuate!"
+        set evacuated? true
+        show "Evacuation started at tick:"
+        show ticks
+      ]
+    ]
+  if evacuated?
+  [
+;      if member? ticks [ time1 time2 time3 time4 time5 time6 time7 time8 time9 ]
+      if ticks = time1 or ticks = time2 or ticks = time3 or ticks = time4 ;or ticks = time5 or ticks = time6 or ticks = time7 or ticks = time8 or ticks = time9
+    [ repeat 10 [ spawn-cars ] ] ]
+  if evacuated? and any? cars [
+    ask cars
+      [ if not stopped? [ move ] ] ]
+
+  if evacuated? and not any? cars with [not stopped?]
+    [ stop ]
+;    if count patches with [pcolor = red] = 0 [ stop ] ]
+  if ticks > 200 and count patches with [pcolor = red] = 0
+    [ stop ]
+  tick
+end
+
+to move
+  face link-dest
+  let dxnode distance link-dest
+  ifelse dxnode > patch-size
+  [fd 1]
+  [
+    ask link-dest [
+      set p1 self
+      ifelse random-float 1 < q
+      [ set p2 min-one-of link-neighbors [ dist-exit ] ]
+      [ set p2 one-of link-neighbors ]
+    ]
+    set current-location p1
+    set link-dest p2
+    ;face link-dest
+  ]
+end
+
+to spread-fire
+    ;; Fire Spread: Ignite neighboring patches
+  ask patches with [pcolor = red]
+    [ let current-elev elev
+      ; Ignition of north patch
+      ask patches at-points [[0 1]]
+      [
+        if veg-density > 0.05 and pcolor != 12 and pcolor != red
+        [ let chance random-float 1.0
+          if elev > current-elev
+          [ if chance < (ignitionN * veg-density + 0.15)
+            [ ignite] ]
+          if elev < current-elev
+          [ if chance < (ignitionN * veg-density - 0.15)
+            [ ignite] ]
+          if elev = current-elev
+          [ if chance < (ignitionN * veg-density)
+            [ ignite] ]
+        ]
+      ]
+
+      ; Ignition of northeast patch
+      ask patches at-points [[1 1]]
+      [
+        if veg-density > 0.05 and pcolor != 12 and pcolor != red
+        [ let chance random-float 1.0
+          if elev > current-elev
+          [ if chance < (((ignitionN + ignitionE) / 2.0) * veg-density + 0.15)
+            [ ignite] ]
+          if elev < current-elev
+          [ if chance < (((ignitionN + ignitionE) / 2.0) * veg-density - 0.15)
+            [ ignite] ]
+          if elev = current-elev
+          [ if chance < (((ignitionN + ignitionE) / 2.0) * veg-density)
+            [ ignite] ]
+        ]
+      ]
+
+      ; Ignition of south patch
+      ask patches at-points [[0 -1]]
+      [
+        if veg-density > 0.05 and pcolor != 12 and pcolor != red
+        [ let chance random-float 1.0
+          if elev > current-elev
+          [ if chance < (ignitionS * veg-density + 0.15)
+            [ ignite] ]
+          if elev < current-elev
+          [ if chance < (ignitionS * veg-density - 0.15)
+            [ ignite] ]
+          if elev = current-elev
+          [ if chance < (ignitionS * veg-density)
+            [ ignite] ]
+        ]
+      ]
+
+      ; Ignition of southeast patch
+      ask patches at-points [[1 -1]]
+      [
+        if veg-density > 0.05 and pcolor != 12 and pcolor != red
+        [ let chance random-float 1.0
+          if elev > current-elev
+          [ if chance < (((ignitionS + ignitionE) / 2.0) * veg-density + 0.15)
+            [ ignite] ]
+          if elev < current-elev
+          [ if chance < (((ignitionS + ignitionE) / 2.0) * veg-density - 0.15)
+            [ ignite] ]
+          if elev = current-elev
+          [ if chance < (((ignitionS + ignitionE) / 2.0) * veg-density)
+            [ ignite] ]
+        ]
+      ]
+
+      ; Ignition of east patch
+      ask patches at-points [[1 0]]
+      [
+        if veg-density > 0.05 and pcolor != 12 and pcolor != red
+        [ let chance random-float 1.0
+          if elev > current-elev
+          [ if chance < (ignitionE * veg-density + 0.15)
+            [ ignite] ]
+          if elev < current-elev
+          [ if chance < (ignitionE * veg-density - 0.15)
+            [ ignite] ]
+          if elev = current-elev
+          [ if chance < (ignitionE * veg-density)
+            [ ignite] ]
+        ]
+      ]
+
+      ; Ignition of southwest patch
+      ask patches at-points [[-1 -1]]
+      [
+        if veg-density > 0.05 and pcolor != 12 and pcolor != red
+        [ let chance random-float 1.0
+          if elev > current-elev
+          [ if chance < (((ignitionS + ignitionW) / 2.0) * veg-density + 0.15)
+            [ ignite] ]
+          if elev < current-elev
+          [ if chance < (((ignitionS + ignitionW) / 2.0) * veg-density - 0.15)
+            [ ignite] ]
+          if elev = current-elev
+          [ if chance < (((ignitionS + ignitionW) / 2.0) * veg-density)
+            [ ignite] ]
+        ]
+      ]
+
+      ; Ignition of west patch
+      ask patches at-points [[-1 0]]
+      [
+        if veg-density > 0.05 and pcolor != 12 and pcolor != red
+        [ let chance random-float 1.0
+          if elev > current-elev
+          [ if chance < (ignitionW * veg-density + 0.15)
+            [ ignite] ]
+          if elev < current-elev
+          [ if chance < (ignitionW * veg-density - 0.15)
+            [ ignite] ]
+          if elev = current-elev
+          [ if chance < (ignitionW * veg-density)
+            [ ignite] ]
+        ]
+      ]
+
+      ; Ignition of northwest patch
+      ask patches at-points [[-1 1]]
+      [
+        if veg-density > 0.05 and pcolor != 12 and pcolor != red
+        [ let chance random-float 1.0
+          if elev > current-elev
+          [ if chance < (((ignitionN + ignitionW) / 2.0) * veg-density + 0.15)
+            [ ignite] ]
+          if elev < current-elev
+          [ if chance < (((ignitionN + ignitionW) / 2.0) * veg-density - 0.15)
+            [ ignite] ]
+          if elev = current-elev
+          [ if chance < (((ignitionN + ignitionW) / 2.0) * veg-density)
+            [ ignite] ]
+        ]
+      ]
+
+    ]
+    ask patches with [pcolor = red]
+  [ extinguish ]
+end
+
+to extinguish
+  if random-float 1.0 < extinction
+  [
+    set pcolor 12
+    set burning? false
+  ]
+end
+
+to-report percent-burned
+  report (burned-trees / initial-trees) * 100
+end
+
+to-report current-burn
+  report count patches with [pcolor = red]
+end
+
+to make-road-network
+  clear-links
+  let first-node nobody
+  let previous-node nobody
+  foreach gis:feature-list-of nodes-dataset [ [?1] ->
+    foreach gis:vertex-lists-of ?1 [ [??1] ->
+
+;      foreach segment [ coordinate ->
+        let location gis:location-of (first ??1)
+        show location
+ if not empty? location [
+          create-nodes 1 [
+            set shape "circle"
+            set color green
+            set size 8
+            set is-dest? 0
+            set xcor item 0 location
+            set ycor item 1 location
+        ]
+      ]
+    ]
+  ]
+end
+
+to make-links
+  ask node 0 [create-link-with node 1]
+  ask node 1 [create-link-with node 27]
+  ask node 1 [create-link-with node 2]
+  ask node 3 [create-link-with node 29]
+  ask node 29 [create-link-with node 23]
+  ask node 29 [create-link-with node 28]
+  ask node 28 [create-link-with node 27]
+  ask node 27 [create-link-with node 24]
+  ask node 24 [create-link-with node 25]
+  ask node 25 [create-link-with node 26]
+  ask node 24 [create-link-with node 21]
+  ask node 24 [create-link-with node 23]
+  ask node 23 [create-link-with node 22]
+  ask node 22 [create-link-with node 21]
+  ask node 22 [create-link-with node 17]
+  ask node 21 [create-link-with node 18]
+  ask node 17 [create-link-with node 18]
+  ask node 18 [create-link-with node 19]
+  ask node 19 [create-link-with node 20]
+  ask node 3 [create-link-with node 4]
+  ask node 4 [create-link-with node 16]
+  ask node 16 [create-link-with node 17]
+  ask node 16 [create-link-with node 15]
+  ask node 15 [create-link-with node 18]
+  ask node 6 [create-link-with node 5]
+  ask node 5 [create-link-with node 4]
+  ask node 5 [create-link-with node 7]
+  ask node 7 [create-link-with node 8]
+  ask node 8 [create-link-with node 9]
+  ask node 8 [create-link-with node 12]
+  ask node 2 [create-link-with node 3]
+  ask node 9 [create-link-with node 10]
+  ask node 10 [create-link-with node 11]
+  ask node 15 [create-link-with node 11]
+  ask node 11 [create-link-with node 12]
+  ask node 12 [create-link-with node 14]
+  ask node 12 [create-link-with node 13]
+  ask links [set color red
+           set thickness 2]
+end
+
+to assign-distances
+  ask nodes [
+    set dist-exit0 (distance node 20)
+    set dist-exit1 (distance node 14)
+    ifelse dist-exit0  < dist-exit1
+      [ set dist-exit dist-exit0 ]
+      [ set dist-exit dist-exit1 ]
+    set color scale-color white dist-exit 0 550
+  ]
+  ask node 20 [ set color blue ]
+  ask node 14 [ set color blue ]
+end
+
+;to setup-cars
+;  ask nodes [
+;    set p1 self
+;    ifelse dist-exit0  < dist-exit1
+;          [ set p2 node 20 ]
+;          [ set p2 node 14 ]
+;    ]
+;
+;    create-cars 1 [
+;      move-to p1
+;      set color yellow
+;      set size 26
+;      set current-location self
+;      set destination p2
+;    ]
+;end
+
+to car-release-times
+  set time0 ticks
+  set time1 ticks + 10
+  set time2 ticks + 20
+  set time3 ticks + 30
+  set time4 ticks + 40
+  set time5 ticks + 50
+  set time6 ticks + 60
+  set time7 ticks + 70
+  set time8 ticks + 80
+  set time9 ticks + 90
+end
+
+to spawn-cars
+      ask nodes [
+        set temp self
+        let dist 1e6
+        ask min-one-of link-neighbors [dist-exit] [if dist-exit < dist
+        [set p2 self
+        set dist dist-exit
+        ]
+  ]]
+      create-cars 1 [
+      move-to temp
+      set color yellow
+      set size 8
+      set current-location temp
+      set link-dest p2
+      set stopped? false
+    ]
+end
